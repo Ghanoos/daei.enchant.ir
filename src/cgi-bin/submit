@@ -1,0 +1,154 @@
+#!/bin/bash
+
+set -o pipefail
+set -o errexit
+
+echo -en "Status: 200 OK\r\n"
+echo -en "Content-type: text/plain;charset=UTF-8\r\n\r\n"
+
+trap '
+echo --
+echo User Agent: $HTTP_USER_AGENT
+echo IP Address: $REMOTE_ADDR
+echo
+echo mehdix.ir
+' EXIT
+
+# Read $CONTENT_LENGTH bytes into POST_STRING variable.
+# This applies only to POST requests.
+# or VAR=$(cat) for multiline input
+#read POST_STRING
+POST_STRING=$(cat)
+
+# https://stackoverflow.com/a/37840948/
+function urldecode() { : "${*//+/ }"; echo -e "${_//%/\\x}"; }
+
+saveIFS=$IFS
+IFS='=&'
+parm=($POST_STRING)
+IFS=$saveIFS
+
+# https://stackoverflow.com/a/3919908/
+for ((i=0; i<${#parm[@]}; i+=2)) do
+	# Convert dashes to underscores and define a variable
+	varname=var_$( echo ${parm[i]} | sed s/-/_/ )
+	declare $varname="$(urldecode ${parm[i+1]})"
+	#echo "${varname}=${!varname}"
+done
+
+# Make sure mandatory fields are present
+([ -z "$var_message" ] || [ -z "$var_name" ] || [ -z "$var_email" ]) && {
+	echo "لطفا برای ثبت دیدگاه متن و نام و ایمیل را وارد کنید."
+	echo "mehdix.ir: missing mandatory form fields." >&2
+	exit 1
+}
+
+# Make sure anti spam field is present and correct
+([ -z "$var_puzzle" ] || [ "$var_puzzle" != "$ALEF_PUZZLE" ]) && {
+	echo "معما رو درست حل نکردی رفیق. نمی‌شه، شرمنده."
+	echo "mehdix.ir: wrong puzzle." >&2
+	exit 1
+}
+
+true && [ -n "$var_reply_to" ] && {
+	#echo is a reply: $var_reply_to
+	#echo getting the email of the OP
+	op_email_query=$(cat <<-EOF
+	SELECT DISTINCT email FROM comments
+	WHERE id = "$var_reply_to" or legacy_id = "$var_reply_to";
+	EOF
+	)
+	op_email=$(sqlite3 "$ALEF_DB" "$op_email_query")
+	#echo "$op_email"
+}
+
+false && [ -n "$var_website" ] && {
+	echo has a websitie: $var_website
+}
+
+false && [ -n "$var_page_id" ] && {
+	echo has a page id: $var_page_id
+}
+
+# Initialize DB if not exists
+[ ! -f "$ALEF_DB" ] && {
+	cat <<EOF | sqlite3 "$ALEF_DB"
+CREATE TABLE IF NOT EXISTS comments (
+	-- A unique ID for each comment
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	-- For legacy ids from disqus and netlify
+	legacy_id TEXT,
+	-- ISO8601 strings with UTC/zulu timezone, try date --iso-8601=seconds --utc
+	time TEXT NOT NULL,
+	-- Comment author's name
+	name TEXT NOT NULL,
+	-- Comment author's email
+	email TEXT NOT NULL,
+	-- The page where the comment belongs to
+	page_id TEXT NOT NULL,
+	-- The ID of a parent comment
+	reply_to TEXT,
+	-- Some URL
+	website TEXT,
+	-- Whether this is a spam (wrong puzzle answer)
+	spam INTEGER NOT NULL,
+	-- The body of the comment
+	message TEXT NOT NULL
+);
+EOF
+}
+
+INSERT_QUERY=$(cat <<-EOF
+	INSERT INTO comments
+		(time, name, email, page_id, reply_to, website, spam, message)
+	VALUES (datetime(), "$var_name", "$var_email", "$var_page_id",
+		"$var_reply_to", "$var_website", "$spam", "$var_message")
+	RETURNING ID;
+EOF
+)
+#echo ALEF_DB "$ALEF_DB"
+#echo INSERT_QUERY "$INSERT_QUERY"
+
+# If file exists and is writable
+[ -w "$ALEF_DB" ] && NEW_ID=$(sqlite3 "$ALEF_DB" "$INSERT_QUERY")
+
+#sqlite3 "$ALEF_DB" "$INSERT_QUERY"
+#echo NEW_ID "$NEW_ID"
+
+# Report success
+echo دیدگاهت ثبت شد و با اولین بیلد وبسایت منتشر خواهد شد.
+
+sub="https://mehdix.ir/$var_page_id.html#$NEW_ID"
+
+# Convert internationalized header to RFC2047 format
+from_author="$(mailutils flt2047 --charset=utf-8 'کامنتدونی')"
+from_header="From: $from_author <noreply@mehdix.ir>"
+
+# mail is from mailutils package
+#Inform the author about the new comment
+cat <<EOF | mail mehdi@mehdix.org -s "دیدگاه جدید" \
+	-a "$from_header" \
+	-a "Content-Type: text/plain; charset=UTF-8"
+${var_name} به دیدگاهت رو سایت مهدیکس جواب داد:
+
+	$var_message
+
+${sub}
+
+--
+کامنتدونی
+EOF
+
+#Inform the OP about the new comment
+[ -n "$op_email" ] && cat <<EOF | mail "$op_email" -s "دیدگاه جدید" \
+	-a "$from_header" \
+	-a "Content-Type: text/plain; charset=UTF-8"
+${var_name} به دیدگاهت رو سایت مهدیکس جواب داد:
+
+	$var_message
+
+${sub}
+
+--
+کامنتدونی
+EOF

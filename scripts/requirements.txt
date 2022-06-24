@@ -1,0 +1,4 @@
+cryptography==3.2
+PyYAML
+requests
+pathlib2
